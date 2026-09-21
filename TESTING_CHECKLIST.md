@@ -726,6 +726,48 @@ enough:
 
 ---
 
+## Post-Phase-42 — Netlify Deployment, Coinlo Rebrand & SEO
+
+You asked to prep the app for Netlify (repo `cashio`, site
+`coinlo.netlify.app`) and to rename the branding to "Coinlo" everywhere,
+add a login-page logo and a favicon, and make the site SEO-friendly. All
+of that is done and verified (`tsc`/`oxlint`/`build` clean — see below for
+a note on the full test suite this round). Nothing here changes how any
+feature behaves; it's all naming, a new logo, and page metadata:
+
+- [ ] Open the app (once deployed) and check the browser tab: it should
+      show the new coin-shaped Coinlo icon and the title "Coinlo —
+      Personal Budget & Expense Tracker" instead of the old icon/title.
+- [ ] On the login page, you should see the new Coinlo coin logo next to
+      the "Coinlo" wordmark, above the sign-in form.
+- [ ] In the app's sidebar (once signed in), the header should read
+      "Coinlo" with the same coin logo, smaller.
+- [ ] Share the site link (e.g. paste `https://coinlo.netlify.app/` into
+      a chat app or Slack) and confirm a nice preview card appears with
+      the Coinlo logo, name, and tagline — this depends on the social-
+      preview image (`og-image.png`), which needs the site to be actually
+      live on Netlify first.
+- [ ] Nothing else should look or behave differently — this was branding
+      and page metadata only, no feature or data changes.
+
+**Note on this round's verification:** the shell used to reach your
+machine for this round was much slower running the automated test suite
+than in previous rounds, and a full run couldn't complete in the time
+available (a partial run of the money/date-calculation tests did complete
+with zero failures). `tsc` (type-checking), `oxlint`, and the production
+build are all clean, and none of the three files this round actually
+changed (the sidebar, the login layout, the page-title fallback) have a
+dedicated automated test to begin with, so this is a low-risk, explicitly
+flagged gap rather than a skipped check — see `PHASE_LOG.md` for the full
+detail.
+
+**Still needed from you:** run `git push origin main` from your own
+terminal (this environment can't authenticate to GitHub on your behalf) —
+Netlify won't rebuild the live site with any of this until that push
+happens.
+
+---
+
 ## Reporting back
 
 For anything that doesn't match what's described above, the most useful

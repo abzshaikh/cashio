@@ -4902,3 +4902,120 @@ already-adequate mitigation elsewhere) are noted but left alone.
 - `npx oxlint` — 0 errors, same pre-existing benign fast-refresh warnings
   as every previous phase.
 - `npm run build` — clean.
+
+## Post-Phase-42 — Netlify deployment prep, Coinlo rebrand & SEO (COMPLETE)
+
+The user created a GitHub repo (`cashio`) and a Netlify site at
+`coinlo.netlify.app`, and asked to (1) prepare the app for Netlify
+deployment, then (2) rename the app's branding from "Budget Tracker" to
+"Coinlo" throughout, add a logo to the login page, add a favicon, and make
+the site SEO-compliant so it ranks in Google search.
+
+**Netlify deployment prep:**
+
+- Added `netlify.toml`: `npm run build` → publish `dist`, pinned
+  `NODE_VERSION = "22"` (this project's Vite/Rolldown needs Node
+  `^20.19.0 || >=22.12.0`), and a catch-all SPA redirect (`/* → /index.html`,
+  200) — required because routing is entirely client-side
+  (`createBrowserRouter`); without it, refreshing on any non-root route
+  (e.g. `/transactions`) 404s on a static host.
+- Cleaned a leftover UTF-16LE-encoded `# cashio` fragment GitHub's
+  auto-created README had left appended after the project's real README
+  content.
+- Set local git identity and made an initial commit of the full app. Git
+  push could not be completed from this environment (the sandboxed shell
+  used to reach the user's machine has no GitHub credentials configured,
+  and per the standing rule against handling credentials/tokens, none
+  were requested or entered) — the user pushes from their own
+  already-authenticated terminal.
+
+**Coinlo rebrand:**
+
+- New `src/components/common/CoinloMark.tsx` — a hand-built SVG "coin with
+  a C cut into it" brand mark, using fixed brand colors
+  (`#1e5f8c`/`#164a6e` fill/stroke, white C) rather than
+  `currentColor`/MUI's `color="primary"` pattern, so the mark reads the
+  same in both light and dark theme instead of shifting with the app's
+  theme-dependent primary color. The "C" is an SVG arc path rather than
+  `<text>` so it stays crisp at every size down to favicon scale.
+- Replaced the generic MUI `AccountBalanceOutlinedIcon` + "Budget Tracker"
+  text with `CoinloMark` + "Coinlo" in `Sidebar.tsx` (nav header, 26px)
+  and `AuthLayout.tsx` (login/register/forgot-password screens, 40px —
+  sized up per the user's specific request for a login-page logo).
+  `AppLayout.tsx`'s page-title fallback (`match?.label ?? 'Budget
+  Tracker'`) updated to `'Coinlo'`. `package.json`'s `name` field
+  (`budget-tracker` → `coinlo`). Confirmed via grep that no
+  "Budget Tracker" string and no leftover `AccountBalanceOutlinedIcon`
+  import remain anywhere the rebrand touched (the icon is still used
+  elsewhere, unrelated, for account/liability *type* icons in
+  `accountTypes.ts`/`liabilityTypes.ts`/`DebtsPage.tsx` — correctly left
+  alone).
+- Deliberately left `ColorModeContext.tsx`'s internal localStorage key
+  (`'budget-tracker:color-mode'`) unchanged — it's not user-facing, and
+  renaming it would silently reset every existing user's dark/light mode
+  preference for no visible benefit.
+
+**Favicon, icons and SEO:**
+
+- Same coin-mark shape duplicated as a static `public/favicon.svg`
+  (browser tab icon for SVG-capable browsers), and rasterized via a
+  documented, reproducible pipeline (`scripts/generate-brand-assets.mjs` —
+  Sharp for PNG rendering, Pillow for multi-resolution `.ico` packing,
+  since Sharp alone doesn't emit `.ico`) into: `favicon.ico` (16/32/48
+  multi-res, for browsers without SVG favicon support), `apple-touch-
+  icon.png` (180×180), `icon-192.png`/`icon-512.png` (PWA/manifest), and
+  `og-image.png` (1200×630 social-preview card: gradient brand-blue
+  background, enlarged coin mark, "Coinlo" + tagline in Poppins).
+- New `public/site.webmanifest` (name, colors, icon references).
+- Rewrote `index.html`: page title and meta description, `theme-color`,
+  canonical URL, favicon/manifest links, full Open Graph and Twitter Card
+  tags pointing at the generated `og-image.png`.
+- New `public/robots.txt` (allow all, points to the sitemap) and
+  `public/sitemap.xml`.
+- **Honest scope note (documented in README):** this app's routing splits
+  into `ProtectedRoute` (redirects unauthenticated visitors away from
+  everything except auth pages) and `PublicOnlyRoute` (`/login`,
+  `/register`, `/forgot-password`), so only those 3 URLs are genuinely
+  public and crawlable — `/` itself just redirects an unauthenticated
+  visitor to `/login`. All the legitimate technical SEO (tags, sitemap,
+  robots.txt, semantic favicon setup) is in place, but a login-gated,
+  client-rendered SPA has an inherent ceiling on Google ranking with
+  almost no public content to index. If better ranking matters later, a
+  real public marketing/landing page (rather than an immediate redirect
+  to `/login`) would move the needle far more than further meta-tag work
+  — noted in README rather than overpromising what metadata alone can do.
+
+**Verified:**
+
+- `npx tsc -b` — clean.
+- `npx oxlint` — 0 errors, same 26 pre-existing benign fast-refresh
+  warnings (`router.tsx`'s lazy-loaded route components) as every prior
+  phase; nothing new from `CoinloMark.tsx`/`Sidebar.tsx`/
+  `AuthLayout.tsx`/`AppLayout.tsx`.
+- `npm run build` — clean; confirmed all 9 new/changed `public/` assets
+  (favicon.svg/.ico, apple-touch-icon.png, icon-192.png, icon-512.png,
+  og-image.png, site.webmanifest, robots.txt, sitemap.xml) land in
+  `dist/`, and the built `dist/index.html` carries the new title, OG/
+  Twitter tags, canonical URL, and icon/manifest links.
+- `npx vitest run` — the on-device shell used to reach the user's machine
+  turned out to be dramatically slower at running Vitest than earlier
+  phases' verification environment (a partial run of just the `utils`
+  suite — 137 of its tests — took the full available time budget without
+  finishing, all passing, zero failures observed), and background/
+  detached runs don't survive between separate shell invocations there,
+  so the full 1124-test suite could not be re-run end-to-end this round.
+  This is judged an acceptable, explicitly-flagged gap rather than a
+  silent skip: every file this round touched is presentational/config
+  (a new logo component, three text/import swaps, static asset files,
+  `index.html` meta tags, README/package.json) with zero business-logic
+  changes; grep confirms none of the three edited components
+  (`Sidebar.tsx`, `AuthLayout.tsx`, `AppLayout.tsx`) has a dedicated test
+  file to begin with; and the partial run that did execute (covering
+  money/date/calculation utilities — the highest-risk area for silent
+  regressions) showed no failures.
+
+**Not yet done (needs the user):** `git push origin main` from the user's
+own authenticated terminal — this environment has no GitHub credentials
+and, per the standing rule against handling credentials, none were
+requested. The live site at `coinlo.netlify.app` won't reflect any of this
+work until that push happens and Netlify rebuilds.
