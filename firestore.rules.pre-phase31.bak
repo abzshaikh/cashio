@@ -1,0 +1,530 @@
+rules_version = '2';
+
+// Deploy with: firebase deploy --only firestore:rules
+// (or paste into Firebase Console > Firestore Database > Rules)
+//
+// This file grows collection-by-collection as each phase adds one — see
+// PHASE_LOG.md. Phase 31 is a dedicated pass to review/harden all of it.
+// The guiding rule throughout (per the product spec): never trust a userId
+// sent from the client — every rule below checks request.auth.uid itself.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // users/{uid} — the signed-in user's own profile document, and no one
+    // else's. Created once at registration; the client may then update
+    // only the fields that make sense to change here (name, avatar,
+    // currency/country/timezone), never `email` (Firebase Auth is the
+    // source of truth for that) and never `uid`.
+    match /users/{userId} {
+      allow read: if request.auth != null && request.auth.uid == userId;
+
+      allow create: if request.auth != null
+        && request.auth.uid == userId
+        && request.resource.data.uid == userId
+        && request.resource.data.email == request.auth.token.email;
+
+      allow update: if request.auth != null
+        && request.auth.uid == userId
+        && request.resource.data.uid == resource.data.uid
+        && request.resource.data.email == resource.data.email;
+
+      allow delete: if false; // account deletion isn't implemented yet
+    }
+
+    // accounts/{accountId} — financial accounts (Phase 3). Every document
+    // carries a userId set by the client at creation; the rules below
+    // independently verify request.auth.uid against it (and against the
+    // stored value on update/delete) rather than trusting what the client
+    // sends, per Rule 10.
+    //
+    // `openingBalance` is immutable once created, and currentBalance must
+    // start out equal to it — from Phase 4 onward, currentBalance is only
+    // ever changed by centralized transaction/transfer logic, but that
+    // logic still runs as this same signed-in user, so it isn't locked down
+    // beyond the standard owner check yet. Phase 31's rules hardening pass
+    // is where that gets revisited once transactions exist to reconcile
+    // balances against.
+    //
+    // `creditLimit`/`statementDay`/`paymentDueDay` (Phase 18) only apply to
+    // a `credit_card` account — the client always sends all three as either
+    // a real value or `null` (see accountService.ts), so this just checks
+    // whichever shape is present is actually valid, without requiring a
+    // credit_card type specifically (a rule can't see `NewAccountInput`'s
+    // TypeScript-level conditioning, only the raw document).
+    function isValidCreditLimit() {
+      return request.resource.data.creditLimit == null || request.resource.data.creditLimit is number;
+    }
+    function isValidDayOfMonth(field) {
+      return request.resource.data[field] == null
+        || (request.resource.data[field] is int
+          && request.resource.data[field] >= 1
+          && request.resource.data[field] <= 31);
+    }
+    match /accounts/{accountId} {
+      allow read: if request.auth != null && request.auth.uid == resource.data.userId;
+
+      allow create: if request.auth != null
+        && request.auth.uid == request.resource.data.userId
+        && request.resource.data.currentBalance == request.resource.data.openingBalance
+        && isValidCreditLimit()
+        && isValidDayOfMonth('statementDay')
+        && isValidDayOfMonth('paymentDueDay');
+
+      allow update: if request.auth != null
+        && request.auth.uid == resource.data.userId
+        && request.resource.data.userId == resource.data.userId
+        && request.resource.data.openingBalance == resource.data.openingBalance
+        && isValidCreditLimit()
+        && isValidDayOfMonth('statementDay')
+        && isValidDayOfMonth('paymentDueDay');
+
+      allow delete: if request.auth != null && request.auth.uid == resource.data.userId;
+    }
+
+    // transactions/{transactionId} — the unified ledger (Phase 4 started it
+    // with income only; Phase 5 added expense; Phase 7 added refund and
+    // adjustment; Phase 8 adds transfer — each phase extended the
+    // `type in [...]` list below as its own UI/logic actually landed — see
+    // types/transaction.ts). An adjustment's sign isn't implied by its type
+    // alone, so its `direction` field is validated here too. A transfer has
+    // no single `accountId` — it moves money between `fromAccountId` and
+    // `toAccountId` instead (Rule 3/4), which must be two different, real
+    // strings; every other type still requires the plain `accountId`.
+    // Every write here is also paired, client-side, with an atomic balance
+    // update to the referenced account(s) (see transactionService.ts); that
+    // second write is authorized independently by the accounts rules above,
+    // which already permit it (owner check only, since currentBalance isn't
+    // locked down yet).
+    //
+    // `type` can't change after creation (no UI does this, and Rule 6's
+    // "reverse old effect, apply new" logic assumes a transaction's type —
+    // and therefore which direction it affects a balance — never changes
+    // out from under it).
+    match /transactions/{transactionId} {
+      allow read: if request.auth != null && request.auth.uid == resource.data.userId;
+
+      allow create: if request.auth != null
+        && request.auth.uid == request.resource.data.userId
+        && request.resource.data.type in ['income', 'expense', 'refund', 'adjustment', 'transfer']
+        && request.resource.data.amount is number
+        && request.resource.data.amount > 0
+        && (request.resource.data.type != 'adjustment'
+            || request.resource.data.direction in ['increase', 'decrease'])
+        && (request.resource.data.type != 'transfer'
+            ? request.resource.data.accountId is string
+            : (request.resource.data.fromAccountId is string
+               && request.resource.data.toAccountId is string
+               && request.resource.data.fromAccountId != request.resource.data.toAccountId));
+
+      allow update: if request.auth != null
+        && request.auth.uid == resource.data.userId
+        && request.resource.data.userId == resource.data.userId
+        && request.resource.data.type == resource.data.type
+        && request.resource.data.amount is number
+        && request.resource.data.amount > 0
+        && (request.resource.data.type != 'adjustment'
+            || request.resource.data.direction in ['increase', 'decrease'])
+        && (request.resource.data.type != 'transfer'
+            ? request.resource.data.accountId is string
+            : (request.resource.data.fromAccountId is string
+               && request.resource.data.toAccountId is string
+               && request.resource.data.fromAccountId != request.resource.data.toAccountId));
+
+      allow delete: if request.auth != null && request.auth.uid == resource.data.userId;
+    }
+
+    // budgets/{budgetId} — Phase 9's spending-limit records. `scope` picks
+    // between one `overallAmount` or a per-category `items` list (never
+    // both meaningfully at once — the unused side is just written as 0/[]
+    // by the client, see budgetService.ts). `items` is a whole-array field,
+    // same reasoning as `expenseCategories`' `subcategories` just above.
+    // Nothing here is immutable — unlike a transaction's `type` or a
+    // category's `slug`, nothing else references a budget by any of its
+    // fields, so there's no stale-reference risk in letting the user
+    // freely edit any part of one.
+    match /budgets/{budgetId} {
+      allow read: if request.auth != null && request.auth.uid == resource.data.userId;
+
+      allow create: if request.auth != null
+        && request.auth.uid == request.resource.data.userId
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.scope in ['overall', 'category']
+        && request.resource.data.overallAmount is number
+        && request.resource.data.items is list
+        && request.resource.data.warningThreshold is number
+        && request.resource.data.overThreshold is number;
+
+      allow update: if request.auth != null
+        && request.auth.uid == resource.data.userId
+        && request.resource.data.userId == resource.data.userId
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.scope in ['overall', 'category']
+        && request.resource.data.overallAmount is number
+        && request.resource.data.items is list
+        && request.resource.data.warningThreshold is number
+        && request.resource.data.overThreshold is number;
+
+      allow delete: if request.auth != null && request.auth.uid == resource.data.userId;
+    }
+
+    // recurringTransactions/{recurringTransactionId} — Phase 14's automatic
+    // recurring-generation engine. Scoped to `type in ['income', 'expense']`
+    // only — the two types that naturally repeat on a schedule (a
+    // specialized expense-only view over these lands in Phase 15's
+    // subscription tracker; a recurring transfer/refund/adjustment is out
+    // of scope for this phase, see PHASE_LOG.md). `type` can't change after
+    // creation, same reasoning as a transaction's `type` above. Every
+    // occurrence a rule generates is written through the same
+    // transactions/accounts rules above (via `transactionService.ts`'s
+    // create functions) — this collection itself only stores the rule and
+    // its schedule bookkeeping (`nextOccurrence`/`lastGeneratedDate`),
+    // which aren't locked down beyond the owner check yet (same
+    // accepted-for-now gap as a transaction's paired balance write —
+    // Phase 31 hardens all of this together).
+    match /recurringTransactions/{recurringTransactionId} {
+      allow read: if request.auth != null && request.auth.uid == resource.data.userId;
+
+      allow create: if request.auth != null
+        && request.auth.uid == request.resource.data.userId
+        && request.resource.data.type in ['income', 'expense']
+        && request.resource.data.amount is number
+        && request.resource.data.amount > 0
+        && request.resource.data.frequency in ['daily', 'weekly', 'monthly', 'quarterly', 'yearly']
+        && request.resource.data.accountId is string;
+
+      allow update: if request.auth != null
+        && request.auth.uid == resource.data.userId
+        && request.resource.data.userId == resource.data.userId
+        && request.resource.data.type == resource.data.type
+        && request.resource.data.amount is number
+        && request.resource.data.amount > 0
+        && request.resource.data.frequency in ['daily', 'weekly', 'monthly', 'quarterly', 'yearly']
+        && request.resource.data.accountId is string;
+
+      allow delete: if request.auth != null && request.auth.uid == resource.data.userId;
+    }
+
+    // savingsGoals/{goalId} — Phase 16's savings-goal records. Deliberately
+    // has no `currentAmount` field to validate: how much has been saved is
+    // always computed client-side from `goalContributions` (see
+    // types/savingsGoal.ts's doc comment), so there's nothing here for a
+    // rule to protect beyond the target itself. `category` is checked
+    // against the fixed enum the same way a recurring rule's `frequency` is
+    // above.
+    match /savingsGoals/{goalId} {
+      allow read: if request.auth != null && request.auth.uid == resource.data.userId;
+
+      allow create: if request.auth != null
+        && request.auth.uid == request.resource.data.userId
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.category in
+          ['emergency_fund', 'vacation', 'major_purchase', 'home', 'vehicle', 'education', 'wedding', 'retirement', 'other']
+        && request.resource.data.targetAmount is number
+        && request.resource.data.targetAmount > 0;
+
+      allow update: if request.auth != null
+        && request.auth.uid == resource.data.userId
+        && request.resource.data.userId == resource.data.userId
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.category in
+          ['emergency_fund', 'vacation', 'major_purchase', 'home', 'vehicle', 'education', 'wedding', 'retirement', 'other']
+        && request.resource.data.targetAmount is number
+        && request.resource.data.targetAmount > 0;
+
+      allow delete: if request.auth != null && request.auth.uid == resource.data.userId;
+    }
+
+    // goalContributions/{contributionId} — one deposit toward a savings
+    // goal (Phase 16). No cross-collection check that `goalId` actually
+    // refers to a goal this user owns (a `get()` lookup per write would add
+    // cost for a client that's already scoped by `userId` and has no
+    // reason to write a `goalId` it can't see anyway) — same accepted gap
+    // budget items and recurring-transaction accountIds already leave for
+    // Phase 31 to harden together. Update is intentionally not allowed —
+    // GoalsPage only ever creates or deletes a contribution, never edits
+    // one in place (see types/goalContribution.ts).
+    match /goalContributions/{contributionId} {
+      allow read: if request.auth != null && request.auth.uid == resource.data.userId;
+
+      allow create: if request.auth != null
+        && request.auth.uid == request.resource.data.userId
+        && request.resource.data.goalId is string
+        && request.resource.data.goalId.size() > 0
+        && request.resource.data.amount is number
+        && request.resource.data.amount > 0;
+
+      allow delete: if request.auth != null && request.auth.uid == resource.data.userId;
+    }
+
+    // debts/{debtId} — Phase 17's debt records (loans, mortgages, money
+    // borrowed from family). Deliberately has no `outstandingAmount` field
+    // to validate, same reasoning as `savingsGoals` above: how much is left
+    // to pay is always computed client-side from `debtPayments` (see
+    // types/debt.ts's doc comment). `paymentDueDay` is checked as an
+    // integer 1–31 the same way a goal's `targetAmount` is checked positive.
+    match /debts/{debtId} {
+      allow read: if request.auth != null && request.auth.uid == resource.data.userId;
+
+      allow create: if request.auth != null
+        && request.auth.uid == request.resource.data.userId
+        && request.resource.data.lender is string
+        && request.resource.data.lender.size() > 0
+        && request.resource.data.category in
+          ['personal_loan', 'student_loan', 'auto_loan', 'mortgage', 'medical_debt', 'borrowed_from_family', 'other']
+        && request.resource.data.originalAmount is number
+        && request.resource.data.originalAmount > 0
+        && request.resource.data.interestRate is number
+        && request.resource.data.interestRate >= 0
+        && request.resource.data.minimumPayment is number
+        && request.resource.data.minimumPayment >= 0
+        && request.resource.data.paymentDueDay is int
+        && request.resource.data.paymentDueDay >= 1
+        && request.resource.data.paymentDueDay <= 31;
+
+      allow update: if request.auth != null
+        && request.auth.uid == resource.data.userId
+        && request.resource.data.userId == resource.data.userId
+        && request.resource.data.lender is string
+        && request.resource.data.lender.size() > 0
+        && request.resource.data.category in
+          ['personal_loan', 'student_loan', 'auto_loan', 'mortgage', 'medical_debt', 'borrowed_from_family', 'other']
+        && request.resource.data.originalAmount is number
+        && request.resource.data.originalAmount > 0
+        && request.resource.data.interestRate is number
+        && request.resource.data.interestRate >= 0
+        && request.resource.data.minimumPayment is number
+        && request.resource.data.minimumPayment >= 0
+        && request.resource.data.paymentDueDay is int
+        && request.resource.data.paymentDueDay >= 1
+        && request.resource.data.paymentDueDay <= 31;
+
+      allow delete: if request.auth != null && request.auth.uid == resource.data.userId;
+    }
+
+    // debtPayments/{paymentId} — one payment made toward a debt (Phase 17),
+    // the debt-tracking mirror of goalContributions above — same accepted
+    // gap on cross-collection debtId ownership, and update intentionally
+    // not allowed for the same create-or-delete-only reasoning (see
+    // types/debtPayment.ts).
+    match /debtPayments/{paymentId} {
+      allow read: if request.auth != null && request.auth.uid == resource.data.userId;
+
+      allow create: if request.auth != null
+        && request.auth.uid == request.resource.data.userId
+        && request.resource.data.debtId is string
+        && request.resource.data.debtId.size() > 0
+        && request.resource.data.amount is number
+        && request.resource.data.amount > 0;
+
+      allow delete: if request.auth != null && request.auth.uid == resource.data.userId;
+    }
+
+    // receipts/{receiptId} — Phase 19's receipt records. The file itself
+    // lives in Storage (see storage.rules), not here — this doc is just
+    // metadata. `transactionId` points at a transaction the same way a
+    // `goalContributions`/`debtPayments` doc points at its parent, except
+    // here it's optional (`null` when the receipt isn't linked to one) and,
+    // unlike those two collections, `update` IS allowed: a receipt's
+    // metadata (merchant/amount/date/notes/linked transaction) can be
+    // edited freely, per types/receipt.ts's doc comment — only the file
+    // fields (`storagePath`/`downloadUrl`/`fileName`/`fileType`/`fileSize`)
+    // are immutable once created, enforced below the same way `accounts`'
+    // `openingBalance` is.
+    match /receipts/{receiptId} {
+      allow read: if request.auth != null && request.auth.uid == resource.data.userId;
+
+      allow create: if request.auth != null
+        && request.auth.uid == request.resource.data.userId
+        && request.resource.data.merchant is string
+        && request.resource.data.merchant.size() > 0
+        && request.resource.data.amount is number
+        && request.resource.data.amount > 0
+        && request.resource.data.storagePath is string
+        && request.resource.data.storagePath.size() > 0
+        && request.resource.data.downloadUrl is string
+        && request.resource.data.downloadUrl.size() > 0;
+
+      allow update: if request.auth != null
+        && request.auth.uid == resource.data.userId
+        && request.resource.data.userId == resource.data.userId
+        && request.resource.data.merchant is string
+        && request.resource.data.merchant.size() > 0
+        && request.resource.data.amount is number
+        && request.resource.data.amount > 0
+        && request.resource.data.storagePath == resource.data.storagePath
+        && request.resource.data.downloadUrl == resource.data.downloadUrl
+        && request.resource.data.fileName == resource.data.fileName
+        && request.resource.data.fileType == resource.data.fileType
+        && request.resource.data.fileSize == resource.data.fileSize;
+
+      allow delete: if request.auth != null && request.auth.uid == resource.data.userId;
+    }
+
+    // expenseCategories/{categoryId} — Phase 6's per-user, editable category
+    // system (replaces the fixed enum Phase 5 shipped with). `slug` is
+    // immutable once created, same reasoning as `type` on a transaction:
+    // transactions reference a category by slug, so changing it out from
+    // under them would silently break every past record's category label.
+    // `subcategories` is a whole-array field (each entry `{slug, name}`) —
+    // Firestore has no per-element permission, so any owner-authorized
+    // write can rewrite the whole array; the client only ever does that
+    // through `categoryService.ts`'s add/rename/remove helpers, which
+    // preserve every entry they don't touch.
+    match /expenseCategories/{categoryId} {
+      allow read: if request.auth != null && request.auth.uid == resource.data.userId;
+
+      allow create: if request.auth != null
+        && request.auth.uid == request.resource.data.userId
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.slug is string
+        && request.resource.data.slug.size() > 0
+        && request.resource.data.subcategories is list;
+
+      allow update: if request.auth != null
+        && request.auth.uid == resource.data.userId
+        && request.resource.data.userId == resource.data.userId
+        && request.resource.data.slug == resource.data.slug
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.subcategories is list;
+
+      allow delete: if request.auth != null && request.auth.uid == resource.data.userId;
+    }
+
+    // tags/{tagId} — Phase 21's per-user tag registry, the exact same
+    // slug/name shape as expenseCategories just above: `slug` is immutable
+    // once created (a transaction's `tags` array references it), `name`
+    // and `color` are freely editable. No subcategory-style array field
+    // here, so create/update are otherwise simpler than expenseCategories'.
+    match /tags/{tagId} {
+      allow read: if request.auth != null && request.auth.uid == resource.data.userId;
+
+      allow create: if request.auth != null
+        && request.auth.uid == request.resource.data.userId
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.slug is string
+        && request.resource.data.slug.size() > 0
+        && request.resource.data.color in
+          ['default', 'primary', 'secondary', 'success', 'error', 'warning', 'info'];
+
+      allow update: if request.auth != null
+        && request.auth.uid == resource.data.userId
+        && request.resource.data.userId == resource.data.userId
+        && request.resource.data.slug == resource.data.slug
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.color in
+          ['default', 'primary', 'secondary', 'success', 'error', 'warning', 'info'];
+
+      allow delete: if request.auth != null && request.auth.uid == resource.data.userId;
+    }
+
+    // budgetTemplates/{budgetTemplateId} — Phase 25's reusable budget
+    // shapes. Same field validation as budgets just above, minus
+    // startDate/endDate (a template deliberately carries no dates of its
+    // own — see types/budgetTemplate.ts) and with no update rule: templates
+    // are create/delete only for this phase, so there's nothing a client
+    // should ever call `updateDoc` on for this collection.
+    match /budgetTemplates/{budgetTemplateId} {
+      allow read: if request.auth != null && request.auth.uid == resource.data.userId;
+
+      allow create: if request.auth != null
+        && request.auth.uid == request.resource.data.userId
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.scope in ['overall', 'category']
+        && request.resource.data.overallAmount is number
+        && request.resource.data.items is list
+        && request.resource.data.warningThreshold is number
+        && request.resource.data.overThreshold is number;
+
+      allow delete: if request.auth != null && request.auth.uid == resource.data.userId;
+    }
+
+    // assets/{assetId} / liabilities/{liabilityId} — Phase 27's manually-
+    // tracked net-worth entries (see types/asset.ts, types/liability.ts).
+    // Each collection is a smaller version of `budgets`' own field
+    // validation: `type` is checked against its own fixed enum,
+    // `value` must be a number, and nothing here is immutable — like
+    // `budgets`, no other collection references an asset/liability by any
+    // of its fields, so full editability carries no stale-reference risk.
+    match /assets/{assetId} {
+      allow read: if request.auth != null && request.auth.uid == resource.data.userId;
+
+      allow create: if request.auth != null
+        && request.auth.uid == request.resource.data.userId
+        && request.resource.data.type in ['property', 'vehicle', 'investment', 'other']
+        && request.resource.data.label is string
+        && request.resource.data.label.size() > 0
+        && request.resource.data.value is number
+        && request.resource.data.value > 0;
+
+      allow update: if request.auth != null
+        && request.auth.uid == resource.data.userId
+        && request.resource.data.userId == resource.data.userId
+        && request.resource.data.type in ['property', 'vehicle', 'investment', 'other']
+        && request.resource.data.label is string
+        && request.resource.data.label.size() > 0
+        && request.resource.data.value is number
+        && request.resource.data.value > 0;
+
+      allow delete: if request.auth != null && request.auth.uid == resource.data.userId;
+    }
+
+    match /liabilities/{liabilityId} {
+      allow read: if request.auth != null && request.auth.uid == resource.data.userId;
+
+      allow create: if request.auth != null
+        && request.auth.uid == request.resource.data.userId
+        && request.resource.data.type in ['loan', 'tax', 'other']
+        && request.resource.data.label is string
+        && request.resource.data.label.size() > 0
+        && request.resource.data.value is number
+        && request.resource.data.value > 0;
+
+      allow update: if request.auth != null
+        && request.auth.uid == resource.data.userId
+        && request.resource.data.userId == resource.data.userId
+        && request.resource.data.type in ['loan', 'tax', 'other']
+        && request.resource.data.label is string
+        && request.resource.data.label.size() > 0
+        && request.resource.data.value is number
+        && request.resource.data.value > 0;
+
+      allow delete: if request.auth != null && request.auth.uid == resource.data.userId;
+    }
+
+    // auditLogs/{auditLogId} — Phase 30's immutable audit trail, written
+    // atomically alongside a transaction's create/update/delete by
+    // `services/transactionService.ts` (via `buildAuditLogWrite` in
+    // `services/auditLogService.ts`). Deliberately has no `allow update`
+    // or `allow delete` at all — omitting a rule means Firestore denies
+    // that operation outright, the same "create-only" pattern already
+    // used above for `goalContributions`/`debtPayments`/`budgetTemplates`
+    // — so an entry can never be edited or removed after the fact, from
+    // the client or from a compromised client credential, once written.
+    match /auditLogs/{auditLogId} {
+      allow read: if request.auth != null && request.auth.uid == resource.data.userId;
+
+      allow create: if request.auth != null
+        && request.auth.uid == request.resource.data.userId
+        && request.resource.data.action in ['create', 'update', 'delete']
+        && request.resource.data.entity is string
+        && request.resource.data.entity.size() > 0
+        && request.resource.data.entityId is string
+        && request.resource.data.entityId.size() > 0;
+    }
+
+    // Everything else is default-deny until its phase adds explicit rules.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

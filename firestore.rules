@@ -1,0 +1,1034 @@
+rules_version = '2';
+
+// Deploy with: firebase deploy --only firestore:rules
+// (or paste into Firebase Console > Firestore Database > Rules)
+//
+// This file grew collection-by-collection as each phase added one — see
+// PHASE_LOG.md. Phase 31 is the dedicated pass promised throughout that
+// history to review and harden all of it in one place, on top of the
+// baseline every phase already kept: never trust a userId sent from the
+// client — every rule below independently checks request.auth.uid itself.
+//
+// What Phase 31 adds on top of that baseline, collection by collection:
+//   1. Field allowlisting — every `create`/`update` rule now also checks
+//      `request.resource.data.keys().hasOnly([...])` against the exact
+//      set of fields that collection's service-layer code ever writes
+//      (verified directly against every `src/services/*.ts` write call,
+//      not just the TypeScript type — a type can describe more than a
+//      rule can see). This doesn't require every listed field to be
+//      present (that's what the individual `is string`/`is number`/etc.
+//      checks below it are for) — it only blocks fields *outside* the
+//      list, closing off arbitrary field injection a hand-crafted
+//      request could otherwise smuggle into any document.
+//   2. Cross-collection ownership checks — every place one collection
+//      references another user document by a plain string id
+//      (`transactions`/`recurringTransactions`' `accountId`(s),
+//      `goalContributions`' `goalId`, `debtPayments`' `debtId`,
+//      `receipts`' optional `transactionId`) now verifies, via a `get()`
+//      lookup, that the referenced document actually belongs to the
+//      same signed-in user — the exact gap called out as "left for
+//      Phase 31 to harden together" in the Phase 16/17 sections of
+//      PHASE_LOG.md. `transactionService.ts` already re-implements this
+//      exact check in application code before every write (see e.g.
+//      `createTransaction`'s "You do not have access to the selected
+//      account" error) — these rules make it true defense-in-depth
+//      rather than something only the official app's own JS enforces,
+//      so a hand-crafted request bypassing the app entirely can't skip
+//      it. To avoid retroactively locking a document out of *unrelated*
+//      edits if the id it references is ever orphaned (e.g. an account
+//      deleted after a recurring rule was pointed at it), an `update`
+//      only re-verifies a reference when that specific field is actually
+//      changing — see `ownsAccount`/`ownsGoal`/`ownsDebt`/
+//      `ownsTransaction` below and their call sites.
+//   3. A few pre-existing gaps fixed outright: `accounts.type`/`.status`
+//      were never checked against their fixed enums (every other
+//      enum-shaped field in this file already was) — Phase 31 closes
+//      that. `auditLogs.timestamp` now must equal `request.time`, so a
+//      hand-crafted request can't backdate/forge an audit entry — every
+//      real write already uses `serverTimestamp()` (see
+//      `auditLogService.ts`), so this changes nothing for the app itself.
+//   4. Reasonable max-length caps (`.size() <= N`) on freeform text
+//      fields (`notes`, `description`, `reason`, `merchant`, `name`,
+//      `label`, `lender`, `source`, `note`) — generous enough that no
+//      real input could ever hit them, but enough to stop a single
+//      document from being inflated into a storage-abuse vector.
+//
+// What Phase 31 deliberately does NOT attempt, and why — the same
+// "document the accepted gap rather than half-fix it" approach every
+// earlier phase already took:
+//   - `accounts.currentBalance` still isn't validated against the
+//     transaction it's supposedly reconciled with. Doing that in rules
+//     would mean re-deriving `getBalanceEffect`'s entire sign logic here
+//     and cross-referencing whichever transaction triggered the update —
+//     effectively duplicating the business logic Rule 6 already
+//     centralizes in `transactionService.ts`, and this project has no
+//     Cloud Functions layer to do it authoritatively server-side instead.
+//     The practical exposure is limited to self-harm: a user can only
+//     ever corrupt their *own* balance this way (every rule below still
+//     independently confines a write to its own owner), never another
+//     user's data, so this is a data-integrity limitation, not a
+//     cross-tenant security hole.
+//   - A budget/budget template's `items` array (`{categoryId, amount}`
+//     entries) and a transaction's `tags` array aren't checked to
+//     reference categories/tags that actually exist — the Firestore
+//     rules language has no per-element `get()` over a variable-length
+//     array, so validating that would mean a bounded, hand-unrolled
+//     check per index, which doesn't scale to "however many categories a
+//     user has." A stale reference here only ever produces a graceful
+//     client-side fallback (shows the raw slug instead of a resolved
+//     name — see `getCategoryLabel`/`getTagLabel`), never a security
+//     exposure, so this is accepted the same way it always has been.
+//   - `storage.rules`' `request.resource.contentType` check (below) is a
+//     client-declared MIME type, not something Firestore/Storage rules
+//     can verify against the file's actual bytes — a determined client
+//     could still upload arbitrary content mislabeled as `image/jpeg`.
+//     Out of scope without a server-side (Cloud Functions) content
+//     inspection step this project doesn't have.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // --- Phase 31 shared cross-collection ownership helpers ----------
+    // Each mirrors the exact "does this id refer to a document I own"
+    // check `transactionService.ts` already performs in application code
+    // before every write that references another collection by id (see
+    // the file header comment above). `exists()` guards `get()` so a
+    // dangling/already-deleted id fails the check cleanly instead of
+    // throwing.
+    function ownsAccount(accountId) {
+      return exists(/databases/$(database)/documents/accounts/$(accountId))
+        && get(/databases/$(database)/documents/accounts/$(accountId)).data.userId == request.auth.uid;
+    }
+    function ownsGoal(goalId) {
+      return exists(/databases/$(database)/documents/savingsGoals/$(goalId))
+        && get(/databases/$(database)/documents/savingsGoals/$(goalId)).data.userId == request.auth.uid;
+    }
+    function ownsDebt(debtId) {
+      return exists(/databases/$(database)/documents/debts/$(debtId))
+        && get(/databases/$(database)/documents/debts/$(debtId)).data.userId == request.auth.uid;
+    }
+    function ownsTransaction(transactionId) {
+      return exists(/databases/$(database)/documents/transactions/$(transactionId))
+        && get(/databases/$(database)/documents/transactions/$(transactionId)).data.userId == request.auth.uid;
+    }
+
+    // users/{uid} — the signed-in user's own profile document, and no one
+    // else's. Created once at registration; the client may then update
+    // only the fields that make sense to change here (name, avatar,
+    // currency/country/timezone), never `email` (Firebase Auth is the
+    // source of truth for that) and never `uid`. Field list matches
+    // `createUserProfile`/`updateUserProfile` in `userProfileService.ts`
+    // exactly.
+    match /users/{userId} {
+      allow read: if request.auth != null && request.auth.uid == userId;
+
+      allow create: if request.auth != null
+        && request.auth.uid == userId
+        && request.resource.data.keys().hasOnly(
+             ['uid', 'firstName', 'lastName', 'email', 'photoURL', 'currency', 'country', 'timezone', 'createdAt', 'updatedAt'])
+        && request.resource.data.uid == userId
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.firstName is string
+        && request.resource.data.firstName.size() <= 200
+        && request.resource.data.lastName is string
+        && request.resource.data.lastName.size() <= 200
+        && (request.resource.data.photoURL == null || request.resource.data.photoURL is string)
+        && request.resource.data.currency is string
+        && request.resource.data.country is string
+        && request.resource.data.timezone is string;
+
+      allow update: if request.auth != null
+        && request.auth.uid == userId
+        && request.resource.data.keys().hasOnly(
+             ['uid', 'firstName', 'lastName', 'email', 'photoURL', 'currency', 'country', 'timezone', 'createdAt', 'updatedAt'])
+        && request.resource.data.uid == resource.data.uid
+        && request.resource.data.email == resource.data.email
+        && request.resource.data.firstName is string
+        && request.resource.data.firstName.size() <= 200
+        && request.resource.data.lastName is string
+        && request.resource.data.lastName.size() <= 200
+        && (request.resource.data.photoURL == null || request.resource.data.photoURL is string)
+        && request.resource.data.currency is string
+        && request.resource.data.country is string
+        && request.resource.data.timezone is string;
+
+      allow delete: if false; // account deletion isn't implemented yet
+    }
+
+    // accounts/{accountId} — financial accounts (Phase 3). Every document
+    // carries a userId set by the client at creation; the rules below
+    // independently verify request.auth.uid against it (and against the
+    // stored value on update/delete) rather than trusting what the client
+    // sends, per Rule 10.
+    //
+    // `openingBalance` is immutable once created, and currentBalance must
+    // start out equal to it. From Phase 4 onward, currentBalance is only
+    // ever changed by centralized transaction/transfer logic — see this
+    // file's header comment for why a rule can't independently verify
+    // *how much* it changed by without duplicating that logic; it remains
+    // editable by the owner beyond that (self-harm-only risk, not a
+    // cross-tenant one).
+    //
+    // Phase 31 adds the `type`/`status` enum checks this block never had
+    // (every other fixed-enum field elsewhere in this file already
+    // validates against its enum — this was a plain oversight) plus the
+    // field allowlist and basic type checks on every other field, sourced
+    // directly from `accountService.ts`'s `createAccount`.
+    //
+    // `creditLimit`/`statementDay`/`paymentDueDay` (Phase 18) only apply to
+    // a `credit_card` account — the client always sends all three as either
+    // a real value or `null` (see accountService.ts), so this just checks
+    // whichever shape is present is actually valid, without requiring a
+    // credit_card type specifically (a rule can't see `NewAccountInput`'s
+    // TypeScript-level conditioning, only the raw document).
+    function isValidCreditLimit() {
+      return request.resource.data.creditLimit == null || request.resource.data.creditLimit is number;
+    }
+    function isValidDayOfMonth(field) {
+      return request.resource.data[field] == null
+        || (request.resource.data[field] is int
+          && request.resource.data[field] >= 1
+          && request.resource.data[field] <= 31);
+    }
+    match /accounts/{accountId} {
+      allow read: if request.auth != null && request.auth.uid == resource.data.userId;
+
+      allow create: if request.auth != null
+        && request.auth.uid == request.resource.data.userId
+        && request.resource.data.keys().hasOnly(
+             ['userId', 'name', 'type', 'institution', 'accountNumber', 'openingBalance', 'currentBalance',
+              'currency', 'status', 'notes', 'creditLimit', 'statementDay', 'paymentDueDay', 'createdAt', 'updatedAt'])
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 200
+        && request.resource.data.type in ['cash', 'bank', 'savings', 'credit_card', 'wallet', 'investment', 'other']
+        && request.resource.data.status in ['active', 'inactive', 'closed']
+        && request.resource.data.institution is string
+        && request.resource.data.accountNumber is string
+        && request.resource.data.currency is string
+        && request.resource.data.notes is string
+        && request.resource.data.notes.size() <= 5000
+        && request.resource.data.openingBalance is number
+        && request.resource.data.currentBalance == request.resource.data.openingBalance
+        && isValidCreditLimit()
+        && isValidDayOfMonth('statementDay')
+        && isValidDayOfMonth('paymentDueDay');
+
+      allow update: if request.auth != null
+        && request.auth.uid == resource.data.userId
+        && request.resource.data.keys().hasOnly(
+             ['userId', 'name', 'type', 'institution', 'accountNumber', 'openingBalance', 'currentBalance',
+              'currency', 'status', 'notes', 'creditLimit', 'statementDay', 'paymentDueDay', 'createdAt', 'updatedAt'])
+        && request.resource.data.userId == resource.data.userId
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 200
+        && request.resource.data.type in ['cash', 'bank', 'savings', 'credit_card', 'wallet', 'investment', 'other']
+        && request.resource.data.status in ['active', 'inactive', 'closed']
+        && request.resource.data.institution is string
+        && request.resource.data.accountNumber is string
+        && request.resource.data.currency is string
+        && request.resource.data.notes is string
+        && request.resource.data.notes.size() <= 5000
+        && request.resource.data.openingBalance == resource.data.openingBalance
+        && isValidCreditLimit()
+        && isValidDayOfMonth('statementDay')
+        && isValidDayOfMonth('paymentDueDay');
+
+      allow delete: if request.auth != null && request.auth.uid == resource.data.userId;
+    }
+
+    // transactions/{transactionId} — the unified ledger (Phase 4 started it
+    // with income only; Phase 5 added expense; Phase 7 added refund and
+    // adjustment; Phase 8 added transfer — each phase extended the
+    // `type in [...]` list below as its own UI/logic actually landed — see
+    // types/transaction.ts). An adjustment's sign isn't implied by its type
+    // alone, so its `direction` field is validated here too. A transfer has
+    // no single `accountId` — it moves money between `fromAccountId` and
+    // `toAccountId` instead (Rule 3/4), which must be two different, real
+    // strings; every other type still requires the plain `accountId`.
+    // Every write here is also paired, client-side, with an atomic balance
+    // update to the referenced account(s) (see transactionService.ts); that
+    // second write is authorized independently by the accounts rules above.
+    //
+    // `type` can't change after creation (no UI does this, and Rule 6's
+    // "reverse old effect, apply new" logic assumes a transaction's type —
+    // and therefore which direction it affects a balance — never changes
+    // out from under it).
+    //
+    // Phase 31 adds: the field allowlist and per-field type/enum/length
+    // checks below (only the fields that actually apply to each `type` are
+    // required — `category`/`subcategory`/`paymentMethod`/`source`/
+    // `isRecurring`/`direction`/`reason` are each only present for the
+    // types that use them, exactly mirroring `transactionService.ts`'s
+    // `extraFields` per type); and `ownsAccount(...)` on every
+    // `accountId`/`fromAccountId`/`toAccountId` this document writes — on
+    // `create` always, on `update` only when that specific field is
+    // actually changing, so reassigning a transaction to a different
+    // account is re-verified but leaving it alone never re-checks an id
+    // that might have since been orphaned (see this file's header comment).
+    match /transactions/{transactionId} {
+      allow read: if request.auth != null && request.auth.uid == resource.data.userId;
+
+      allow create: if request.auth != null
+        && request.auth.uid == request.resource.data.userId
+        && request.resource.data.keys().hasOnly(
+             ['userId', 'type', 'amount', 'date', 'description', 'notes', 'merchant', 'tags', 'createdAt', 'updatedAt',
+              'accountId', 'category', 'source', 'isRecurring', 'subcategory', 'paymentMethod', 'direction', 'reason',
+              'fromAccountId', 'toAccountId'])
+        && request.resource.data.type in ['income', 'expense', 'refund', 'adjustment', 'transfer']
+        && request.resource.data.amount is number
+        && request.resource.data.amount > 0
+        && request.resource.data.date is timestamp
+        && request.resource.data.description is string
+        && request.resource.data.notes is string
+        && request.resource.data.notes.size() <= 5000
+        && request.resource.data.merchant is string
+        && request.resource.data.tags is list
+        && request.resource.data.tags.size() <= 20
+        && (request.resource.data.type != 'adjustment'
+            || (request.resource.data.direction in ['increase', 'decrease']
+                && request.resource.data.reason is string
+                && request.resource.data.reason.size() <= 500))
+        && (request.resource.data.type != 'income'
+            || (request.resource.data.category in
+                  ['salary', 'freelance_income', 'business_income', 'interest', 'rental_income', 'bonus', 'gift', 'refund', 'other_income']
+                && request.resource.data.source is string
+                && request.resource.data.source.size() <= 200
+                && request.resource.data.isRecurring is bool))
+        && (!(request.resource.data.type in ['expense', 'refund'])
+            || (request.resource.data.category is string
+                && request.resource.data.category.size() <= 200
+                && request.resource.data.subcategory is string
+                && request.resource.data.subcategory.size() <= 200))
+        && (request.resource.data.type != 'expense'
+            || request.resource.data.paymentMethod in
+                 ['cash', 'debit_card', 'credit_card', 'upi', 'net_banking', 'wallet', 'cheque', 'other'])
+        && (request.resource.data.type != 'transfer'
+            ? (request.resource.data.accountId is string
+               && ownsAccount(request.resource.data.accountId))
+            : (request.resource.data.fromAccountId is string
+               && request.resource.data.toAccountId is string
+               && request.resource.data.fromAccountId != request.resource.data.toAccountId
+               && ownsAccount(request.resource.data.fromAccountId)
+               && ownsAccount(request.resource.data.toAccountId)));
+
+      allow update: if request.auth != null
+        && request.auth.uid == resource.data.userId
+        && request.resource.data.keys().hasOnly(
+             ['userId', 'type', 'amount', 'date', 'description', 'notes', 'merchant', 'tags', 'createdAt', 'updatedAt',
+              'accountId', 'category', 'source', 'isRecurring', 'subcategory', 'paymentMethod', 'direction', 'reason',
+              'fromAccountId', 'toAccountId'])
+        && request.resource.data.userId == resource.data.userId
+        && request.resource.data.type == resource.data.type
+        && request.resource.data.amount is number
+        && request.resource.data.amount > 0
+        && request.resource.data.date is timestamp
+        && request.resource.data.description is string
+        && request.resource.data.notes is string
+        && request.resource.data.notes.size() <= 5000
+        && request.resource.data.merchant is string
+        && request.resource.data.tags is list
+        && request.resource.data.tags.size() <= 20
+        && (request.resource.data.type != 'adjustment'
+            || (request.resource.data.direction in ['increase', 'decrease']
+                && request.resource.data.reason is string
+                && request.resource.data.reason.size() <= 500))
+        && (request.resource.data.type != 'income'
+            || (request.resource.data.category in
+                  ['salary', 'freelance_income', 'business_income', 'interest', 'rental_income', 'bonus', 'gift', 'refund', 'other_income']
+                && request.resource.data.source is string
+                && request.resource.data.source.size() <= 200
+                && request.resource.data.isRecurring is bool))
+        && (!(request.resource.data.type in ['expense', 'refund'])
+            || (request.resource.data.category is string
+                && request.resource.data.category.size() <= 200
+                && request.resource.data.subcategory is string
+                && request.resource.data.subcategory.size() <= 200))
+        && (request.resource.data.type != 'expense'
+            || request.resource.data.paymentMethod in
+                 ['cash', 'debit_card', 'credit_card', 'upi', 'net_banking', 'wallet', 'cheque', 'other'])
+        && (request.resource.data.type != 'transfer'
+            ? (request.resource.data.accountId is string
+               && (request.resource.data.accountId == resource.data.accountId || ownsAccount(request.resource.data.accountId)))
+            : (request.resource.data.fromAccountId is string
+               && request.resource.data.toAccountId is string
+               && request.resource.data.fromAccountId != request.resource.data.toAccountId
+               && (request.resource.data.fromAccountId == resource.data.fromAccountId || ownsAccount(request.resource.data.fromAccountId))
+               && (request.resource.data.toAccountId == resource.data.toAccountId || ownsAccount(request.resource.data.toAccountId))));
+
+      allow delete: if request.auth != null && request.auth.uid == resource.data.userId;
+    }
+
+    // budgets/{budgetId} — Phase 9's spending-limit records. `scope` picks
+    // between one `overallAmount` or a per-category `items` list (never
+    // both meaningfully at once — the unused side is just written as 0/[]
+    // by the client, see budgetService.ts). `items` is a whole-array field,
+    // same reasoning as `expenseCategories`' `subcategories` just below —
+    // Phase 31 caps its length (and every other whole-array field in this
+    // file) as a sane upper bound rather than validating each entry's
+    // shape, which the rules language has no practical way to do for a
+    // variable-length array (see this file's header comment). Nothing here
+    // is immutable — unlike a transaction's `type` or a category's `slug`,
+    // nothing else references a budget by any of its fields, so there's no
+    // stale-reference risk in letting the user freely edit any part of one.
+    match /budgets/{budgetId} {
+      allow read: if request.auth != null && request.auth.uid == resource.data.userId;
+
+      allow create: if request.auth != null
+        && request.auth.uid == request.resource.data.userId
+        && request.resource.data.keys().hasOnly(
+             ['userId', 'name', 'period', 'startDate', 'endDate', 'scope', 'overallAmount', 'items',
+              'warningThreshold', 'overThreshold', 'createdAt', 'updatedAt'])
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 200
+        && request.resource.data.period in ['monthly', 'weekly', 'custom']
+        && request.resource.data.startDate is timestamp
+        && request.resource.data.endDate is timestamp
+        && request.resource.data.scope in ['overall', 'category']
+        && request.resource.data.overallAmount is number
+        && request.resource.data.overallAmount >= 0
+        && request.resource.data.items is list
+        && request.resource.data.items.size() <= 100
+        && request.resource.data.warningThreshold is number
+        && request.resource.data.warningThreshold >= 0
+        && request.resource.data.overThreshold is number
+        && request.resource.data.overThreshold >= 0;
+
+      allow update: if request.auth != null
+        && request.auth.uid == resource.data.userId
+        && request.resource.data.keys().hasOnly(
+             ['userId', 'name', 'period', 'startDate', 'endDate', 'scope', 'overallAmount', 'items',
+              'warningThreshold', 'overThreshold', 'createdAt', 'updatedAt'])
+        && request.resource.data.userId == resource.data.userId
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 200
+        && request.resource.data.period in ['monthly', 'weekly', 'custom']
+        && request.resource.data.startDate is timestamp
+        && request.resource.data.endDate is timestamp
+        && request.resource.data.scope in ['overall', 'category']
+        && request.resource.data.overallAmount is number
+        && request.resource.data.overallAmount >= 0
+        && request.resource.data.items is list
+        && request.resource.data.items.size() <= 100
+        && request.resource.data.warningThreshold is number
+        && request.resource.data.warningThreshold >= 0
+        && request.resource.data.overThreshold is number
+        && request.resource.data.overThreshold >= 0;
+
+      allow delete: if request.auth != null && request.auth.uid == resource.data.userId;
+    }
+
+    // recurringTransactions/{recurringTransactionId} — Phase 14's automatic
+    // recurring-generation engine. Scoped to `type in ['income', 'expense']`
+    // only — the two types that naturally repeat on a schedule. `type`
+    // can't change after creation, same reasoning as a transaction's `type`
+    // above. Every occurrence a rule generates is written through the same
+    // transactions/accounts rules above (via `transactionService.ts`'s
+    // create functions) — this collection itself only stores the rule and
+    // its schedule bookkeeping (`nextOccurrence`/`lastGeneratedDate`).
+    //
+    // Phase 31 adds `ownsAccount(accountId)` (only re-verified when
+    // `accountId` is actually changing — see this file's header comment
+    // for why: `setRecurringTransactionActive`/`generateDueOccurrences`
+    // both call `update()` without touching `accountId` at all, and
+    // shouldn't be newly blocked just because the account they've always
+    // pointed at was deleted since), plus the field allowlist and
+    // remaining type checks, sourced directly from
+    // `recurringTransactionService.ts`'s `toFirestoreFields` — every field
+    // it lists is written unconditionally (defaulted to `''`/`'other'`/
+    // `false` for whichever side of `type` doesn't apply, never omitted),
+    // so unlike `transactions` above, no per-type conditional presence is
+    // needed here beyond the income category enum.
+    match /recurringTransactions/{recurringTransactionId} {
+      allow read: if request.auth != null && request.auth.uid == resource.data.userId;
+
+      allow create: if request.auth != null
+        && request.auth.uid == request.resource.data.userId
+        && request.resource.data.keys().hasOnly(
+             ['userId', 'type', 'amount', 'frequency', 'startDate', 'endDate', 'accountId', 'description', 'notes',
+              'category', 'subcategory', 'merchant', 'paymentMethod', 'isSubscription', 'source',
+              'isActive', 'nextOccurrence', 'lastGeneratedDate', 'createdAt', 'updatedAt'])
+        && request.resource.data.type in ['income', 'expense']
+        && request.resource.data.amount is number
+        && request.resource.data.amount > 0
+        && request.resource.data.frequency in ['daily', 'weekly', 'monthly', 'quarterly', 'yearly']
+        && request.resource.data.startDate is timestamp
+        && (request.resource.data.endDate == null || request.resource.data.endDate is timestamp)
+        && request.resource.data.accountId is string
+        && ownsAccount(request.resource.data.accountId)
+        && request.resource.data.description is string
+        && request.resource.data.notes is string
+        && request.resource.data.notes.size() <= 5000
+        && request.resource.data.category is string
+        && (request.resource.data.type != 'income'
+            || request.resource.data.category in
+                 ['salary', 'freelance_income', 'business_income', 'interest', 'rental_income', 'bonus', 'gift', 'refund', 'other_income'])
+        && request.resource.data.subcategory is string
+        && request.resource.data.merchant is string
+        && request.resource.data.paymentMethod in
+             ['cash', 'debit_card', 'credit_card', 'upi', 'net_banking', 'wallet', 'cheque', 'other']
+        && request.resource.data.isSubscription is bool
+        && request.resource.data.source is string
+        && request.resource.data.isActive is bool
+        && request.resource.data.nextOccurrence is timestamp
+        && (request.resource.data.lastGeneratedDate == null || request.resource.data.lastGeneratedDate is timestamp);
+
+      allow update: if request.auth != null
+        && request.auth.uid == resource.data.userId
+        && request.resource.data.keys().hasOnly(
+             ['userId', 'type', 'amount', 'frequency', 'startDate', 'endDate', 'accountId', 'description', 'notes',
+              'category', 'subcategory', 'merchant', 'paymentMethod', 'isSubscription', 'source',
+              'isActive', 'nextOccurrence', 'lastGeneratedDate', 'createdAt', 'updatedAt'])
+        && request.resource.data.userId == resource.data.userId
+        && request.resource.data.type == resource.data.type
+        && request.resource.data.amount is number
+        && request.resource.data.amount > 0
+        && request.resource.data.frequency in ['daily', 'weekly', 'monthly', 'quarterly', 'yearly']
+        && request.resource.data.startDate is timestamp
+        && (request.resource.data.endDate == null || request.resource.data.endDate is timestamp)
+        && request.resource.data.accountId is string
+        && (request.resource.data.accountId == resource.data.accountId || ownsAccount(request.resource.data.accountId))
+        && request.resource.data.description is string
+        && request.resource.data.notes is string
+        && request.resource.data.notes.size() <= 5000
+        && request.resource.data.category is string
+        && (request.resource.data.type != 'income'
+            || request.resource.data.category in
+                 ['salary', 'freelance_income', 'business_income', 'interest', 'rental_income', 'bonus', 'gift', 'refund', 'other_income'])
+        && request.resource.data.subcategory is string
+        && request.resource.data.merchant is string
+        && request.resource.data.paymentMethod in
+             ['cash', 'debit_card', 'credit_card', 'upi', 'net_banking', 'wallet', 'cheque', 'other']
+        && request.resource.data.isSubscription is bool
+        && request.resource.data.source is string
+        && request.resource.data.isActive is bool
+        && request.resource.data.nextOccurrence is timestamp
+        && (request.resource.data.lastGeneratedDate == null || request.resource.data.lastGeneratedDate is timestamp);
+
+      allow delete: if request.auth != null && request.auth.uid == resource.data.userId;
+    }
+
+    // savingsGoals/{goalId} — Phase 16's savings-goal records. Deliberately
+    // has no `currentAmount` field to validate: how much has been saved is
+    // always computed client-side from `goalContributions` (see
+    // types/savingsGoal.ts's doc comment). `category` is checked against
+    // the fixed enum the same way a recurring rule's `frequency` is above.
+    match /savingsGoals/{goalId} {
+      allow read: if request.auth != null && request.auth.uid == resource.data.userId;
+
+      allow create: if request.auth != null
+        && request.auth.uid == request.resource.data.userId
+        && request.resource.data.keys().hasOnly(
+             ['userId', 'name', 'category', 'targetAmount', 'targetDate', 'notes', 'createdAt', 'updatedAt'])
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 200
+        && request.resource.data.category in
+          ['emergency_fund', 'vacation', 'major_purchase', 'home', 'vehicle', 'education', 'wedding', 'retirement', 'other']
+        && request.resource.data.targetAmount is number
+        && request.resource.data.targetAmount > 0
+        && (request.resource.data.targetDate == null || request.resource.data.targetDate is timestamp)
+        && request.resource.data.notes is string
+        && request.resource.data.notes.size() <= 5000;
+
+      allow update: if request.auth != null
+        && request.auth.uid == resource.data.userId
+        && request.resource.data.keys().hasOnly(
+             ['userId', 'name', 'category', 'targetAmount', 'targetDate', 'notes', 'createdAt', 'updatedAt'])
+        && request.resource.data.userId == resource.data.userId
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 200
+        && request.resource.data.category in
+          ['emergency_fund', 'vacation', 'major_purchase', 'home', 'vehicle', 'education', 'wedding', 'retirement', 'other']
+        && request.resource.data.targetAmount is number
+        && request.resource.data.targetAmount > 0
+        && (request.resource.data.targetDate == null || request.resource.data.targetDate is timestamp)
+        && request.resource.data.notes is string
+        && request.resource.data.notes.size() <= 5000;
+
+      allow delete: if request.auth != null && request.auth.uid == resource.data.userId;
+    }
+
+    // goalContributions/{contributionId} — one deposit toward a savings
+    // goal (Phase 16). Phase 31 adds `ownsGoal(goalId)` here — see this
+    // file's header comment — closing the exact gap this block's comment
+    // used to describe as accepted. Update is intentionally not allowed —
+    // GoalsPage only ever creates or deletes a contribution, never edits
+    // one in place (see types/goalContribution.ts).
+    match /goalContributions/{contributionId} {
+      allow read: if request.auth != null && request.auth.uid == resource.data.userId;
+
+      allow create: if request.auth != null
+        && request.auth.uid == request.resource.data.userId
+        && request.resource.data.keys().hasOnly(['userId', 'goalId', 'amount', 'date', 'note', 'createdAt', 'updatedAt'])
+        && request.resource.data.goalId is string
+        && request.resource.data.goalId.size() > 0
+        && ownsGoal(request.resource.data.goalId)
+        && request.resource.data.amount is number
+        && request.resource.data.amount > 0
+        && request.resource.data.date is timestamp
+        && request.resource.data.note is string
+        && request.resource.data.note.size() <= 2000;
+
+      allow delete: if request.auth != null && request.auth.uid == resource.data.userId;
+    }
+
+    // debts/{debtId} — Phase 17's debt records (loans, mortgages, money
+    // borrowed from family). Deliberately has no `outstandingAmount` field
+    // to validate, same reasoning as `savingsGoals` above: how much is left
+    // to pay is always computed client-side from `debtPayments` (see
+    // types/debt.ts's doc comment).
+    match /debts/{debtId} {
+      allow read: if request.auth != null && request.auth.uid == resource.data.userId;
+
+      allow create: if request.auth != null
+        && request.auth.uid == request.resource.data.userId
+        && request.resource.data.keys().hasOnly(
+             ['userId', 'lender', 'category', 'originalAmount', 'interestRate', 'minimumPayment', 'paymentDueDay',
+              'startDate', 'endDate', 'notes', 'createdAt', 'updatedAt'])
+        && request.resource.data.lender is string
+        && request.resource.data.lender.size() > 0
+        && request.resource.data.lender.size() <= 200
+        && request.resource.data.category in
+          ['personal_loan', 'student_loan', 'auto_loan', 'mortgage', 'medical_debt', 'borrowed_from_family', 'other']
+        && request.resource.data.originalAmount is number
+        && request.resource.data.originalAmount > 0
+        && request.resource.data.interestRate is number
+        && request.resource.data.interestRate >= 0
+        && request.resource.data.minimumPayment is number
+        && request.resource.data.minimumPayment >= 0
+        && request.resource.data.paymentDueDay is int
+        && request.resource.data.paymentDueDay >= 1
+        && request.resource.data.paymentDueDay <= 31
+        && request.resource.data.startDate is timestamp
+        && (request.resource.data.endDate == null || request.resource.data.endDate is timestamp)
+        && request.resource.data.notes is string
+        && request.resource.data.notes.size() <= 5000;
+
+      allow update: if request.auth != null
+        && request.auth.uid == resource.data.userId
+        && request.resource.data.keys().hasOnly(
+             ['userId', 'lender', 'category', 'originalAmount', 'interestRate', 'minimumPayment', 'paymentDueDay',
+              'startDate', 'endDate', 'notes', 'createdAt', 'updatedAt'])
+        && request.resource.data.userId == resource.data.userId
+        && request.resource.data.lender is string
+        && request.resource.data.lender.size() > 0
+        && request.resource.data.lender.size() <= 200
+        && request.resource.data.category in
+          ['personal_loan', 'student_loan', 'auto_loan', 'mortgage', 'medical_debt', 'borrowed_from_family', 'other']
+        && request.resource.data.originalAmount is number
+        && request.resource.data.originalAmount > 0
+        && request.resource.data.interestRate is number
+        && request.resource.data.interestRate >= 0
+        && request.resource.data.minimumPayment is number
+        && request.resource.data.minimumPayment >= 0
+        && request.resource.data.paymentDueDay is int
+        && request.resource.data.paymentDueDay >= 1
+        && request.resource.data.paymentDueDay <= 31
+        && request.resource.data.startDate is timestamp
+        && (request.resource.data.endDate == null || request.resource.data.endDate is timestamp)
+        && request.resource.data.notes is string
+        && request.resource.data.notes.size() <= 5000;
+
+      allow delete: if request.auth != null && request.auth.uid == resource.data.userId;
+    }
+
+    // debtPayments/{paymentId} — one payment made toward a debt (Phase 17),
+    // the debt-tracking mirror of goalContributions above — Phase 31 adds
+    // `ownsDebt(debtId)` here for the exact same reason, and update is
+    // intentionally not allowed for the same create-or-delete-only
+    // reasoning (see types/debtPayment.ts).
+    match /debtPayments/{paymentId} {
+      allow read: if request.auth != null && request.auth.uid == resource.data.userId;
+
+      allow create: if request.auth != null
+        && request.auth.uid == request.resource.data.userId
+        && request.resource.data.keys().hasOnly(['userId', 'debtId', 'amount', 'date', 'note', 'createdAt', 'updatedAt'])
+        && request.resource.data.debtId is string
+        && request.resource.data.debtId.size() > 0
+        && ownsDebt(request.resource.data.debtId)
+        && request.resource.data.amount is number
+        && request.resource.data.amount > 0
+        && request.resource.data.date is timestamp
+        && request.resource.data.note is string
+        && request.resource.data.note.size() <= 2000;
+
+      allow delete: if request.auth != null && request.auth.uid == resource.data.userId;
+    }
+
+    // receipts/{receiptId} — Phase 19's receipt records. The file itself
+    // lives in Storage (see storage.rules), not here — this doc is just
+    // metadata. `transactionId` points at a transaction the same way a
+    // `goalContributions`/`debtPayments` doc points at its parent, except
+    // here it's optional (`null` when the receipt isn't linked to one) and,
+    // unlike those two collections, `update` IS allowed: a receipt's
+    // metadata (merchant/amount/date/notes/linked transaction) can be
+    // edited freely — only the file fields (`storagePath`/`downloadUrl`/
+    // `fileName`/`fileType`/`fileSize`) are immutable once created.
+    //
+    // Phase 31 adds `ownsTransaction(transactionId)` whenever it's set to a
+    // non-null value — on `create` unconditionally (when not null), on
+    // `update` only when it's actually changing to a new non-null value
+    // (same "don't re-check an unchanged reference" reasoning as
+    // `recurringTransactions.accountId` above — a receipt linked to a
+    // transaction that's since been deleted should still be freely
+    // editable, just not re-*linkable* to something unowned).
+    match /receipts/{receiptId} {
+      allow read: if request.auth != null && request.auth.uid == resource.data.userId;
+
+      allow create: if request.auth != null
+        && request.auth.uid == request.resource.data.userId
+        && request.resource.data.keys().hasOnly(
+             ['userId', 'merchant', 'amount', 'date', 'notes', 'transactionId', 'storagePath', 'downloadUrl',
+              'fileName', 'fileType', 'fileSize', 'createdAt', 'updatedAt'])
+        && request.resource.data.merchant is string
+        && request.resource.data.merchant.size() > 0
+        && request.resource.data.merchant.size() <= 200
+        && request.resource.data.amount is number
+        && request.resource.data.amount > 0
+        && request.resource.data.date is timestamp
+        && request.resource.data.notes is string
+        && request.resource.data.notes.size() <= 5000
+        && (request.resource.data.transactionId == null || ownsTransaction(request.resource.data.transactionId))
+        && request.resource.data.storagePath is string
+        && request.resource.data.storagePath.size() > 0
+        && request.resource.data.downloadUrl is string
+        && request.resource.data.downloadUrl.size() > 0
+        && request.resource.data.fileName is string
+        && request.resource.data.fileType is string
+        && request.resource.data.fileSize is number
+        && request.resource.data.fileSize > 0;
+
+      allow update: if request.auth != null
+        && request.auth.uid == resource.data.userId
+        && request.resource.data.keys().hasOnly(
+             ['userId', 'merchant', 'amount', 'date', 'notes', 'transactionId', 'storagePath', 'downloadUrl',
+              'fileName', 'fileType', 'fileSize', 'createdAt', 'updatedAt'])
+        && request.resource.data.userId == resource.data.userId
+        && request.resource.data.merchant is string
+        && request.resource.data.merchant.size() > 0
+        && request.resource.data.merchant.size() <= 200
+        && request.resource.data.amount is number
+        && request.resource.data.amount > 0
+        && request.resource.data.date is timestamp
+        && request.resource.data.notes is string
+        && request.resource.data.notes.size() <= 5000
+        && (request.resource.data.transactionId == resource.data.transactionId
+            || request.resource.data.transactionId == null
+            || ownsTransaction(request.resource.data.transactionId))
+        && request.resource.data.storagePath == resource.data.storagePath
+        && request.resource.data.downloadUrl == resource.data.downloadUrl
+        && request.resource.data.fileName == resource.data.fileName
+        && request.resource.data.fileType == resource.data.fileType
+        && request.resource.data.fileSize == resource.data.fileSize;
+
+      allow delete: if request.auth != null && request.auth.uid == resource.data.userId;
+    }
+
+    // expenseCategories/{categoryId} — Phase 6's per-user, editable category
+    // system. `slug` is immutable once created, same reasoning as `type` on
+    // a transaction: transactions reference a category by slug, so changing
+    // it out from under them would silently break every past record's
+    // category label. `subcategories` is a whole-array field (each entry
+    // `{slug, name}`) — Firestore has no per-element permission, so any
+    // owner-authorized write can rewrite the whole array; the client only
+    // ever does that through `categoryService.ts`'s add/rename/remove
+    // helpers, which preserve every entry they don't touch. Phase 31 also
+    // locks `isDefault` as immutable — the app never changes it after
+    // creation either.
+    match /expenseCategories/{categoryId} {
+      allow read: if request.auth != null && request.auth.uid == resource.data.userId;
+
+      allow create: if request.auth != null
+        && request.auth.uid == request.resource.data.userId
+        && request.resource.data.keys().hasOnly(['userId', 'name', 'slug', 'isDefault', 'subcategories', 'createdAt', 'updatedAt'])
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 200
+        && request.resource.data.slug is string
+        && request.resource.data.slug.size() > 0
+        && request.resource.data.slug.size() <= 200
+        && request.resource.data.isDefault is bool
+        && request.resource.data.subcategories is list
+        && request.resource.data.subcategories.size() <= 100;
+
+      allow update: if request.auth != null
+        && request.auth.uid == resource.data.userId
+        && request.resource.data.keys().hasOnly(['userId', 'name', 'slug', 'isDefault', 'subcategories', 'createdAt', 'updatedAt'])
+        && request.resource.data.userId == resource.data.userId
+        && request.resource.data.slug == resource.data.slug
+        && request.resource.data.isDefault == resource.data.isDefault
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 200
+        && request.resource.data.subcategories is list
+        && request.resource.data.subcategories.size() <= 100;
+
+      allow delete: if request.auth != null && request.auth.uid == resource.data.userId;
+    }
+
+    // tags/{tagId} — Phase 21's per-user tag registry, the exact same
+    // slug/name shape as expenseCategories just above: `slug` is immutable
+    // once created (a transaction's `tags` array references it), `name`
+    // and `color` are freely editable.
+    match /tags/{tagId} {
+      allow read: if request.auth != null && request.auth.uid == resource.data.userId;
+
+      allow create: if request.auth != null
+        && request.auth.uid == request.resource.data.userId
+        && request.resource.data.keys().hasOnly(['userId', 'name', 'slug', 'color', 'createdAt', 'updatedAt'])
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 200
+        && request.resource.data.slug is string
+        && request.resource.data.slug.size() > 0
+        && request.resource.data.slug.size() <= 200
+        && request.resource.data.color in
+          ['default', 'primary', 'secondary', 'success', 'error', 'warning', 'info'];
+
+      allow update: if request.auth != null
+        && request.auth.uid == resource.data.userId
+        && request.resource.data.keys().hasOnly(['userId', 'name', 'slug', 'color', 'createdAt', 'updatedAt'])
+        && request.resource.data.userId == resource.data.userId
+        && request.resource.data.slug == resource.data.slug
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 200
+        && request.resource.data.color in
+          ['default', 'primary', 'secondary', 'success', 'error', 'warning', 'info'];
+
+      allow delete: if request.auth != null && request.auth.uid == resource.data.userId;
+    }
+
+    // budgetTemplates/{budgetTemplateId} — Phase 25's reusable budget
+    // shapes. Same field validation as budgets above, minus startDate/
+    // endDate (a template deliberately carries no dates of its own) and
+    // with no update rule: templates are create/delete only for this
+    // phase, so there's nothing a client should ever call `updateDoc` on
+    // for this collection.
+    match /budgetTemplates/{budgetTemplateId} {
+      allow read: if request.auth != null && request.auth.uid == resource.data.userId;
+
+      allow create: if request.auth != null
+        && request.auth.uid == request.resource.data.userId
+        && request.resource.data.keys().hasOnly(
+             ['userId', 'name', 'period', 'scope', 'overallAmount', 'items', 'warningThreshold', 'overThreshold', 'createdAt', 'updatedAt'])
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 200
+        && request.resource.data.period in ['monthly', 'weekly', 'custom']
+        && request.resource.data.scope in ['overall', 'category']
+        && request.resource.data.overallAmount is number
+        && request.resource.data.overallAmount >= 0
+        && request.resource.data.items is list
+        && request.resource.data.items.size() <= 100
+        && request.resource.data.warningThreshold is number
+        && request.resource.data.warningThreshold >= 0
+        && request.resource.data.overThreshold is number
+        && request.resource.data.overThreshold >= 0;
+
+      allow delete: if request.auth != null && request.auth.uid == resource.data.userId;
+    }
+
+    // assets/{assetId} / liabilities/{liabilityId} — Phase 27's manually-
+    // tracked net-worth entries (see types/asset.ts, types/liability.ts).
+    // Each collection is a smaller version of `budgets`' own field
+    // validation: `type` is checked against its own fixed enum, `value`
+    // must be a number, and nothing here is immutable — like `budgets`, no
+    // other collection references an asset/liability by any of its fields,
+    // so full editability carries no stale-reference risk.
+    match /assets/{assetId} {
+      allow read: if request.auth != null && request.auth.uid == resource.data.userId;
+
+      allow create: if request.auth != null
+        && request.auth.uid == request.resource.data.userId
+        && request.resource.data.keys().hasOnly(['userId', 'type', 'label', 'value', 'asOf', 'createdAt', 'updatedAt'])
+        && request.resource.data.type in ['property', 'vehicle', 'investment', 'other']
+        && request.resource.data.label is string
+        && request.resource.data.label.size() > 0
+        && request.resource.data.label.size() <= 200
+        && request.resource.data.value is number
+        && request.resource.data.value > 0
+        && request.resource.data.asOf is timestamp;
+
+      allow update: if request.auth != null
+        && request.auth.uid == resource.data.userId
+        && request.resource.data.keys().hasOnly(['userId', 'type', 'label', 'value', 'asOf', 'createdAt', 'updatedAt'])
+        && request.resource.data.userId == resource.data.userId
+        && request.resource.data.type in ['property', 'vehicle', 'investment', 'other']
+        && request.resource.data.label is string
+        && request.resource.data.label.size() > 0
+        && request.resource.data.label.size() <= 200
+        && request.resource.data.value is number
+        && request.resource.data.value > 0
+        && request.resource.data.asOf is timestamp;
+
+      allow delete: if request.auth != null && request.auth.uid == resource.data.userId;
+    }
+
+    match /liabilities/{liabilityId} {
+      allow read: if request.auth != null && request.auth.uid == resource.data.userId;
+
+      allow create: if request.auth != null
+        && request.auth.uid == request.resource.data.userId
+        && request.resource.data.keys().hasOnly(['userId', 'type', 'label', 'value', 'asOf', 'createdAt', 'updatedAt'])
+        && request.resource.data.type in ['loan', 'tax', 'other']
+        && request.resource.data.label is string
+        && request.resource.data.label.size() > 0
+        && request.resource.data.label.size() <= 200
+        && request.resource.data.value is number
+        && request.resource.data.value > 0
+        && request.resource.data.asOf is timestamp;
+
+      allow update: if request.auth != null
+        && request.auth.uid == resource.data.userId
+        && request.resource.data.keys().hasOnly(['userId', 'type', 'label', 'value', 'asOf', 'createdAt', 'updatedAt'])
+        && request.resource.data.userId == resource.data.userId
+        && request.resource.data.type in ['loan', 'tax', 'other']
+        && request.resource.data.label is string
+        && request.resource.data.label.size() > 0
+        && request.resource.data.label.size() <= 200
+        && request.resource.data.value is number
+        && request.resource.data.value > 0
+        && request.resource.data.asOf is timestamp;
+
+      allow delete: if request.auth != null && request.auth.uid == resource.data.userId;
+    }
+
+    // auditLogs/{auditLogId} — Phase 30's immutable audit trail, written
+    // atomically alongside a transaction's create/update/delete by
+    // `services/transactionService.ts` (via `buildAuditLogWrite` in
+    // `services/auditLogService.ts`). Deliberately has no `allow update`
+    // or `allow delete` at all — omitting a rule means Firestore denies
+    // that operation outright, the same "create-only" pattern already used
+    // above for `goalContributions`/`debtPayments`/`budgetTemplates` — so
+    // an entry can never be edited or removed after the fact.
+    //
+    // Phase 31 adds `timestamp == request.time`, forcing every entry's
+    // timestamp to be the server's own commit time rather than anything a
+    // client could set — `buildAuditLogWrite` already only ever writes
+    // `serverTimestamp()` here, so this changes nothing for the app but
+    // closes off a hand-crafted request backdating an entry. Also adds the
+    // field allowlist and `previousValue`/`newValue` map-or-null checks.
+    match /auditLogs/{auditLogId} {
+      allow read: if request.auth != null && request.auth.uid == resource.data.userId;
+
+      allow create: if request.auth != null
+        && request.auth.uid == request.resource.data.userId
+        && request.resource.data.keys().hasOnly(['userId', 'action', 'entity', 'entityId', 'previousValue', 'newValue', 'timestamp'])
+        && request.resource.data.action in ['create', 'update', 'delete']
+        && request.resource.data.entity is string
+        && request.resource.data.entity.size() > 0
+        && request.resource.data.entity.size() <= 100
+        && request.resource.data.entityId is string
+        && request.resource.data.entityId.size() > 0
+        && request.resource.data.entityId.size() <= 200
+        && (request.resource.data.previousValue == null || request.resource.data.previousValue is map)
+        && (request.resource.data.newValue == null || request.resource.data.newValue is map)
+        && request.resource.data.timestamp == request.time;
+    }
+
+    // notifications/{notificationId} — Phase 35's persisted, cross-session
+    // alerts, the durable counterpart to Phase 24's always-recomputed,
+    // never-stored `Insight[]` (see `utils/notificationSync.ts`). Every
+    // field except `read` is set once at creation and never changes again
+    // — a notification is a snapshot of "this was true as of this time,"
+    // not a live-updating tile — so `update` only allows toggling `read`;
+    // every other field must stay equal to what's already stored, the same
+    // "everything immutable except one explicitly-allowed field" pattern
+    // `expenseCategories`'s `slug`/`isDefault` and `receipts`'s file
+    // metadata already use above. `sourceKey` mirrors the originating
+    // `Insight.id` but isn't itself validated against anything — this
+    // collection has no way to know what a valid insight id looks like
+    // without duplicating `insightsEngine.ts`'s rule set here, and a
+    // malformed `sourceKey` only ever weakens this user's own dedup
+    // behavior (see this file's header comment on accepted, self-harm-only
+    // gaps), never anyone else's data.
+    match /notifications/{notificationId} {
+      allow read: if request.auth != null && request.auth.uid == resource.data.userId;
+
+      allow create: if request.auth != null
+        && request.auth.uid == request.resource.data.userId
+        && request.resource.data.keys().hasOnly(
+             ['userId', 'sourceKey', 'severity', 'title', 'message', 'actionLabel', 'actionPath',
+              'read', 'createdAt', 'updatedAt'])
+        && request.resource.data.sourceKey is string
+        && request.resource.data.sourceKey.size() > 0
+        && request.resource.data.sourceKey.size() <= 200
+        && request.resource.data.severity in ['critical', 'warning', 'info', 'positive']
+        && request.resource.data.title is string
+        && request.resource.data.title.size() > 0
+        && request.resource.data.title.size() <= 200
+        && request.resource.data.message is string
+        && request.resource.data.message.size() <= 2000
+        && (request.resource.data.actionLabel == null || request.resource.data.actionLabel is string)
+        && (request.resource.data.actionPath == null || request.resource.data.actionPath is string)
+        && request.resource.data.read == false;
+
+      allow update: if request.auth != null
+        && request.auth.uid == resource.data.userId
+        && request.resource.data.keys().hasOnly(
+             ['userId', 'sourceKey', 'severity', 'title', 'message', 'actionLabel', 'actionPath',
+              'read', 'createdAt', 'updatedAt'])
+        && request.resource.data.userId == resource.data.userId
+        && request.resource.data.sourceKey == resource.data.sourceKey
+        && request.resource.data.severity == resource.data.severity
+        && request.resource.data.title == resource.data.title
+        && request.resource.data.message == resource.data.message
+        && request.resource.data.actionLabel == resource.data.actionLabel
+        && request.resource.data.actionPath == resource.data.actionPath
+        && request.resource.data.read is bool;
+
+      allow delete: if request.auth != null && request.auth.uid == resource.data.userId;
+    }
+
+    // Phase 36: one document per user at `settings/{uid}` — the doc ID
+    // *is* the UID, exactly like `users/{userId}` above, rather than a
+    // `userId` field on an auto-ID document like every list-shaped
+    // collection elsewhere in this file. `create`/`update` share the same
+    // validation (there's no "immutable once set" field here — every
+    // preference can always be changed) and both require the full field
+    // set: the client (`saveUserSettings`) always writes the complete
+    // object, never a partial patch, so a document with only some of
+    // these fields would only ever mean a malicious or buggy write, not a
+    // legitimate partial save.
+    match /settings/{userId} {
+      allow read: if request.auth != null && request.auth.uid == userId;
+
+      allow create, update: if request.auth != null
+        && request.auth.uid == userId
+        && request.resource.data.keys().hasOnly(
+             ['userId', 'defaultBudgetPeriod', 'defaultBudgetWarningThreshold',
+              'defaultBudgetOverThreshold', 'defaultAccountId', 'defaultCategoryId',
+              'notifyOnSeverity', 'dashboardWidgets', 'updatedAt'])
+        && request.resource.data.userId == userId
+        && request.resource.data.defaultBudgetPeriod in ['monthly', 'weekly', 'custom']
+        && request.resource.data.defaultBudgetWarningThreshold is number
+        && request.resource.data.defaultBudgetWarningThreshold >= 0
+        && request.resource.data.defaultBudgetOverThreshold is number
+        && request.resource.data.defaultBudgetOverThreshold >= 0
+        && (request.resource.data.defaultAccountId == null || request.resource.data.defaultAccountId is string)
+        && (request.resource.data.defaultCategoryId == null || request.resource.data.defaultCategoryId is string)
+        && request.resource.data.notifyOnSeverity.keys().hasOnly(['critical', 'warning', 'info', 'positive'])
+        && request.resource.data.notifyOnSeverity.critical is bool
+        && request.resource.data.notifyOnSeverity.warning is bool
+        && request.resource.data.notifyOnSeverity.info is bool
+        && request.resource.data.notifyOnSeverity.positive is bool
+        // Phase 39: which dashboard widgets show, and in what order — an
+        // id's absence means hidden, so this can legitimately be empty.
+        && request.resource.data.dashboardWidgets is list
+        && request.resource.data.dashboardWidgets.hasOnly(['activeBudgets', 'recentTransactions', 'categorySpending']);
+
+      allow delete: if false;
+    }
+
+    // Everything else is default-deny until its phase adds explicit rules.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

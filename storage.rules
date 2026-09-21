@@ -1,0 +1,40 @@
+rules_version = '2';
+
+// Deploy with: firebase deploy --only storage
+// (or paste into Firebase Console > Storage > Rules)
+//
+// Phase 19 (Receipt Management) is the first feature that needs Firebase
+// Storage — see PHASE_LOG.md. Every receipt file lives under
+// receipts/{userId}/{fileName} (see services/receiptService.ts's
+// uploadReceiptFile), which is what lets this rule enforce per-user
+// isolation with a plain path match, the same owner-scoping principle
+// firestore.rules uses via a stored userId field.
+//
+// Uploads are create-only (no `allow update`) — a receipt's file is
+// immutable once uploaded (see types/receipt.ts's doc comment); replacing
+// one means deleting the receipt and adding a new one.
+//
+// Phase 31 security review note: `request.resource.contentType` below is
+// a client-declared MIME type, not something Storage rules can verify
+// against the file's actual bytes — a determined client could still
+// upload arbitrary content mislabeled as `image/jpeg`. Closing that gap
+// would need a server-side (Cloud Functions) content-inspection step,
+// which this project doesn't have; accepted as an out-of-scope limitation
+// (see the equivalent note in firestore.rules's own header comment).
+// Everything else here — per-user path isolation, the 5 MB size cap, and
+// owner-only read/create/delete — was already in good shape and needed
+// no changes this phase.
+service firebase.storage {
+  match /b/{bucket}/o {
+    match /receipts/{userId}/{fileName} {
+      allow read: if request.auth != null && request.auth.uid == userId;
+
+      allow create: if request.auth != null
+        && request.auth.uid == userId
+        && request.resource.size < 5 * 1024 * 1024
+        && request.resource.contentType.matches('image/.*|application/pdf');
+
+      allow delete: if request.auth != null && request.auth.uid == userId;
+    }
+  }
+}
