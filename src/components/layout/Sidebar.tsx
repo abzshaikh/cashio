@@ -5,8 +5,8 @@ import ListItemIcon from '@mui/material/ListItemIcon';
 import ListItemText from '@mui/material/ListItemText';
 import Box from '@mui/material/Box';
 import Typography from '@mui/material/Typography';
-import AccountBalanceOutlinedIcon from '@mui/icons-material/AccountBalanceOutlined';
 import { navItems } from '../../config/navConfig';
+import { CoinloMark } from '../common/CoinloMark';
 
 interface SidebarProps {
   onNavigate?: () => void;
@@ -18,9 +18,9 @@ export function Sidebar({ onNavigate }: SidebarProps) {
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
       <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, px: 2.5, py: 2.5 }}>
-        <AccountBalanceOutlinedIcon color="primary" />
+        <CoinloMark size={26} />
         <Typography variant="h6" component="span" noWrap sx={{ fontWeight: 700 }}>
-          Budget Tracker
+          Coinlo
         </Typography>
       </Box>
       <List component="nav" sx={{ px: 1.5, flex: 1 }}>

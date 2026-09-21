@@ -31,7 +31,7 @@ export function AppLayout() {
     const match = navItems.find((item) =>
       item.path === '/' ? location.pathname === '/' : location.pathname.startsWith(item.path),
     );
-    return match?.label ?? 'Budget Tracker';
+    return match?.label ?? 'Coinlo';
   }, [location.pathname]);
 
   return (

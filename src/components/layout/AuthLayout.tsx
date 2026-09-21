@@ -3,7 +3,7 @@ import Box from '@mui/material/Box';
 import Paper from '@mui/material/Paper';
 import Stack from '@mui/material/Stack';
 import Typography from '@mui/material/Typography';
-import AccountBalanceOutlinedIcon from '@mui/icons-material/AccountBalanceOutlined';
+import { CoinloMark } from '../common/CoinloMark';
 
 export function AuthLayout() {
   return (
@@ -26,9 +26,9 @@ export function AuthLayout() {
           spacing={1.5}
           sx={{ alignItems: 'center', mb: 3, justifyContent: 'center' }}
         >
-          <AccountBalanceOutlinedIcon color="primary" fontSize="large" />
+          <CoinloMark size={40} />
           <Typography variant="h5" sx={{ fontWeight: 700 }}>
-            Budget Tracker
+            Coinlo
           </Typography>
         </Stack>
         <Outlet />

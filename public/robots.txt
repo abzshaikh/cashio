@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://coinlo.netlify.app/sitemap.xml

@@ -1,7 +1,11 @@
-# Budget Tracker
+# Coinlo
 
-A personal budget and expense management application. See `PHASE_LOG.md` for
-the full 42-phase build plan, current status, and design decisions.
+A personal budget and expense management application, deployed at
+[coinlo.netlify.app](https://coinlo.netlify.app/). See `PHASE_LOG.md` for the
+full 42-phase build plan, current status, and design decisions — the app was
+built and documented under the working name "Budget Tracker" and renamed to
+Coinlo once its Netlify domain was registered, so earlier phase entries refer
+to it by the old name.
 
 ## Tech stack
 
@@ -86,6 +90,42 @@ Make sure Firebase Storage itself has been enabled for this project in the
 Firebase Console first (Build → Storage → Get started) if it hasn't been
 already — the CLI deploy only pushes the rules, it doesn't provision the
 Storage bucket.
+
+## Deploying to Netlify
+
+The app is hosted at [coinlo.netlify.app](https://coinlo.netlify.app/),
+built from this repo's `main` branch. `netlify.toml` configures the build
+(`npm run build`, publishing `dist/`) and a catch-all redirect to
+`index.html` — required because this is a client-side-routed (React
+Router) single-page app, so every path needs to fall through to the app
+shell rather than 404ing on Netlify's static file server.
+
+Firebase web config isn't committed (`.env` is git-ignored), so it has to
+be set as Netlify environment variables separately — Site configuration →
+Environment variables — using the same `VITE_FIREBASE_*` names as
+`.env.example`. These are safe to expose (see "Environment variables"
+above); Netlify's UI just needs its own copy since it can't read `.env`.
+
+### Branding and SEO
+
+The app is branded as "Coinlo" (see `src/components/common/CoinloMark.tsx`
+for the logo mark, and `scripts/generate-brand-assets.mjs` for how the
+favicon/social-preview PNGs were generated from it) and `index.html` carries
+a description, Open Graph/Twitter card tags, and a canonical URL pointing
+at the Netlify domain; `public/robots.txt` and `public/sitemap.xml` list
+the three pages a logged-out visitor can actually reach (`/login`,
+`/register`, and `/`, which redirects to `/login`).
+
+Worth being upfront about: this is a client-rendered, login-gated app —
+everything past the login screen requires a real account, so there's
+essentially no public content for Google to index or rank on competitive
+terms. The tags above make what *is* public (the login/register screens,
+and how a shared link previews on social platforms) as clean as they can
+be, but they won't make an authenticated personal-finance tool rank the
+way a public marketing site or blog would. A dedicated public landing page
+describing the product (rather than an immediate redirect to `/login`)
+would do more for organic search than any further meta-tag work, if that's
+ever wanted.
 
 ## Project structure
 
